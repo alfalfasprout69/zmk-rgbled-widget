@@ -1,5 +1,6 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/led.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
@@ -13,6 +14,8 @@
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/events/split_peripheral_status_changed.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/usb.h>
 #include <zmk/keymap.h>
 #include <zmk/split/bluetooth/peripheral.h>
 
@@ -339,6 +342,85 @@ ZMK_LISTENER(led_layer_listener, led_layer_listener_cb);
 ZMK_SUBSCRIPTION(led_layer_listener, zmk_layer_state_changed);
 #endif // SHOW_LAYER_CHANGE
 
+
+#if IS_ENABLED(CONFIG_ZMK_USB)
+// ARROW PAD CHANGE: charging indicator.
+// While USB is plugged in: orange blink = charging, solid orange = full.
+// The XIAO nRF52840 charger status pin is P0.17: low = charging, high = not charging.
+// (Colour 3 = red + green, which looks orange on the onboard LED.)
+#define CHG_GPIO_PIN 17
+#define CHG_CHARGING_LEVEL 0 // change to 1 if blink and solid turn out to be swapped
+#define CHG_COLOR 3
+#define CHG_POLL_MS 1000
+
+enum charge_state { CHARGE_NONE, CHARGE_CHARGING, CHARGE_FULL };
+static enum charge_state charge_state = CHARGE_NONE;
+static const struct device *chg_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+static bool chg_configured = false;
+
+static void charge_set_solid(bool on) {
+    struct blink_item item = {.color = on ? CHG_COLOR : 0, .duration_ms = 0};
+    led_layer_color = item.color;
+    k_msgq_put(&led_msgq, &item, K_NO_WAIT);
+}
+
+static void charge_work_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(charge_work, charge_work_cb);
+
+static void charge_work_cb(struct k_work *work) {
+    if (!initialized) {
+        // wait until the start-up flashes are finished
+        k_work_reschedule(&charge_work, K_MSEC(500));
+        return;
+    }
+
+    if (!zmk_usb_is_powered()) {
+        // USB unplugged: clear the indicator and stop polling (saves power on battery)
+        if (charge_state == CHARGE_FULL) {
+            charge_set_solid(false);
+        }
+        charge_state = CHARGE_NONE;
+        return;
+    }
+
+    if (!device_is_ready(chg_dev)) {
+        return;
+    }
+    if (!chg_configured) {
+        gpio_pin_configure(chg_dev, CHG_GPIO_PIN, GPIO_INPUT | GPIO_PULL_UP);
+        chg_configured = true;
+    }
+
+    int level = gpio_pin_get_raw(chg_dev, CHG_GPIO_PIN);
+    if (level >= 0) {
+        enum charge_state next =
+            (level == CHG_CHARGING_LEVEL) ? CHARGE_CHARGING : CHARGE_FULL;
+
+        if (next == CHARGE_FULL && charge_state != CHARGE_FULL) {
+            charge_set_solid(true);
+        } else if (next == CHARGE_CHARGING && charge_state == CHARGE_FULL) {
+            charge_set_solid(false);
+        }
+        if (next == CHARGE_CHARGING) {
+            struct blink_item blink = {.color = CHG_COLOR, .duration_ms = 200};
+            k_msgq_put(&led_msgq, &blink, K_NO_WAIT);
+        }
+        charge_state = next;
+    }
+
+    k_work_reschedule(&charge_work, K_MSEC(CHG_POLL_MS));
+}
+
+// re-check whenever USB is plugged in or unplugged
+static int charge_usb_listener_cb(const zmk_event_t *eh) {
+    k_work_reschedule(&charge_work, K_MSEC(300));
+    return 0;
+}
+
+ZMK_LISTENER(charge_usb_listener, charge_usb_listener_cb);
+ZMK_SUBSCRIPTION(charge_usb_listener, zmk_usb_conn_state_changed);
+#endif // IS_ENABLED(CONFIG_ZMK_USB)
+
 extern void led_process_thread(void *d0, void *d1, void *d2) {
     ARG_UNUSED(d0);
     ARG_UNUSED(d1);
@@ -407,6 +489,9 @@ extern void led_init_thread(void *d0, void *d1, void *d2) {
 #endif // SHOW_LAYER_COLORS
 
     initialized = true;
+#if IS_ENABLED(CONFIG_ZMK_USB)
+    k_work_reschedule(&charge_work, K_MSEC(200));
+#endif
     LOG_INF("Finished initializing LED widget");
 }
 
